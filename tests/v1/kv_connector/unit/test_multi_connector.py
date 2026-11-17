@@ -3,6 +3,7 @@
 import filecmp
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -286,6 +287,23 @@ def test_loaded_groups_follow_the_connector_serving_the_request(mc, chosen):
     assert mc.get_num_new_matched_tokens(request, 0) == (16, True)
     assert mc.get_loaded_kv_cache_group_ids(request) == (chosen,)
     mc._connectors[1 - chosen].get_loaded_kv_cache_group_ids.assert_not_called()
+
+
+@pytest.mark.cpu_test
+def test_multi_connector_forwards_engine_wakeup(mc: MultiConnector):
+    callbacks: list[Callable[[], None]] = []
+    wakeups = []
+
+    def callback():
+        wakeups.append(True)
+
+    for connector in mc._connectors:
+        connector.set_engine_wakeup = callbacks.append
+    mc.set_engine_wakeup(callback)
+    assert callbacks == [callback, callback]
+    for wakeup in callbacks:
+        wakeup()
+    assert wakeups == [True, True]
 
 
 def test_multi_connector_mem_pool_context_none(mc: MultiConnector):
