@@ -209,6 +209,7 @@ class NativeOwner:
         "owner_deferred_reject_missing_key",
         "owner_deferred_reject_cap",
         "owner_deferred_reject_budget",
+        "owner_external_refs",
     )
 
     def __init__(

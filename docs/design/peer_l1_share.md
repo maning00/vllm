@@ -56,7 +56,7 @@ IPC batches share a copy stream and one completion callback releases all grants
 for the step. A possible failed load retains ownership under fail-stop; there is
 no timer that can release a possibly active IPC read.
 
-Leased async grants retain their original lease clock. Queueing, setup and the GPU fence
+RDMA grants retain their original lease clock. Queueing, setup and the GPU fence
 must fit within half that lease. The first possible post starts the transfer
 budget, capped by the same bound; subsequent segments do not renew it.
 
@@ -67,4 +67,47 @@ abort or normal finish can free the request's references. Quarantine belongs to
 the transfer identity, independently of the request, until drain or process exit.
 An elapsed lease or failed status alone is not drain proof.
 
-Discovery validates epoch, geometry and hash settings before selecting an owner.
+After failure, that live admission excludes RDMA sources; source cooldown and the
+quarantine circuit breaker apply independently. Source cleanup uses epoch and
+sequence, so a restarted owner cannot lose a newer grant through stale cleanup.
+
+Published registrations and potentially referenced argument/status objects live until
+process exit when revocation or drain cannot be proven. Discovery and replica
+refresh run off the request ingress path; HELLO revalidation before a post rejects
+an already observable owner restart while the job was queued.
+
+## Read transport
+
+`PeerReadTransport(storage, host, options)` registers the complete backing
+allocation synchronously. Its class `name` is the wire identity: discovery
+requires equal transport names as well as KV and hash compatibility. A lazy
+registry resolves `rdma_transport` names or `module:Class` implementations;
+without a selection, exactly one implementation must be available.
+
+The interface separates preparation, posting, completion and drain:
+
+- `available()` checks dependencies; `advertisement() -> bytes` exports opaque
+  registration metadata; `open(advertisement) -> RemoteSession` creates a session.
+- `prepare(ranges) -> ReadBatch` prepares `(local_offset, remote_offset, bytes)`
+  ranges without posting. `post(batch) -> None` can partially submit before raising.
+- `ReadBatch.state() -> ReadState` returns `PENDING`, `SUCCEEDED` or `FAILED`.
+  Success proves quiescence; failure alone does not.
+- `ReadBatch.quiesced() -> bool` never waits, including during concurrent posts,
+  status checks or cleanup. A serialized backend must return `False` if its lock
+  is held; handle release must use that same lock.
+- `close() -> None` returns promptly without revoking published registrations
+  or freeing anything an unquiesced batch can use.
+
+The executor splits and batches ranges using `max_range_bytes` and
+`max_ranges_per_post`. It owns queueing, step fences, deadlines, HELLO checks and
+process-lifetime retention, independently of the transport implementation.
+An exception from `post()` leaves that read permanently unknown, even if a
+returned status later indicates success. A normal post followed by a deadline
+still permits drain queries and removal of quarantine once quiesced; the failed
+request never becomes successful afterward.
+
+Published registrations and their backing storage remain retained until process
+exit even when no local read is outstanding: remote unilateral reads cannot be
+enumerated or revoked. Unquiesced reads additionally retain batches, sessions,
+descriptors and submission arguments. The MoRI-IO implementation uses the
+existing engine wrapper and its owned-read helpers.
