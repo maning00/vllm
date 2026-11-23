@@ -13,6 +13,43 @@ KVConsumer = Literal["kv_consumer", "kv_both"]
 KVRole = Literal[KVProducer, KVConsumer]
 
 
+def pd_replay_retention_enabled(config: "KVTransferConfig | None") -> bool:
+    """Resolve the opt-in storage policy, including a MultiConnector child."""
+    if config is None:
+        return False
+    if config.kv_connector == "MultiConnector":
+        children = config.kv_connector_extra_config.get("connectors", [])
+    else:
+        children = [
+            {
+                "kv_connector": config.kv_connector,
+                "kv_role": config.kv_role,
+                "kv_connector_extra_config": config.kv_connector_extra_config,
+            }
+        ]
+    enabled = []
+    for child in children:
+        options = child.get("kv_connector_extra_config", {})
+        value = options.get("pd_replay_retention", False)
+        if not isinstance(value, bool):
+            raise ValueError("pd_replay_retention must be a JSON boolean")
+        if value:
+            if child.get("kv_connector") != "MoRIIOConnector" or str(
+                options.get("read_mode", False)
+            ).strip().lower() not in ("true", "1"):
+                raise ValueError(
+                    "pd_replay_retention requires MoRIIOConnector READ mode"
+                )
+            if child.get("kv_role") not in ("kv_producer", "kv_consumer"):
+                raise ValueError(
+                    "PD replay retention requires a producer or consumer role"
+                )
+            enabled.append(child)
+    if len(enabled) > 1:
+        raise ValueError("Only one PD replay-retention connector may be configured")
+    return bool(enabled)
+
+
 def hisparse_host_pool_gib(
     kv_transfer_config: "KVTransferConfig | None",
 ) -> float | None:

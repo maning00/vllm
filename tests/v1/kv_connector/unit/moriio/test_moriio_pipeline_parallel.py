@@ -107,6 +107,7 @@ def test_every_stage_worker_binds_its_own_ports(pp_size, tp_size, dp_size):
 def _decode_scheduler(*, send: bool = False) -> MoRIIOConnectorScheduler:
     """A decode scheduler that records its notifications, or sends them."""
     scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.pd_replay = None
     scheduler.mode = MoRIIOMode.WRITE
     scheduler.is_producer = False
     scheduler.kv_transfer_config = SimpleNamespace(kv_connector_extra_config={})
@@ -134,6 +135,7 @@ def _decode_scheduler(*, send: bool = False) -> MoRIIOConnectorScheduler:
 def _prefill_scheduler(pp_size: int, tp_size: int, host: str, notify_port: int):
     """The prefill-side state request_finished reads."""
     scheduler = SimpleNamespace(
+        pd_replay=None,
         is_producer=True,
         _is_hma_required=False,
         _has_mamba=False,

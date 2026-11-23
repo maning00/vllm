@@ -79,6 +79,7 @@ class _FakeScheduler(moriio_connector.MoRIIOConnectorScheduler):  # type: ignore
     attributes read by the method under test are set."""
 
     def __init__(self, **attrs):
+        self.pd_replay = None
         self.mode = MoRIIOMode.READ
         self.is_producer = False
         self.kv_transfer_config = SimpleNamespace(kv_connector_extra_config={})

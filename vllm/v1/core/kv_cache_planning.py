@@ -1657,14 +1657,37 @@ def get_global_kv_cache_groups(
 
     # When speculating with more than 1 speculative module (e.g. multi-layered MTP)
     # tag every sliding window with how many extra tokens to retain in the window.
+    from vllm.config.kv_transfer import pd_replay_retention_enabled
+
+    replay_retention = pd_replay_retention_enabled(vllm_config.kv_transfer_config)
+    replay_margin = (
+        max(1, vllm_config.num_hash_lookahead_tokens)
+        + math.lcm(*(lc.spec.block_size for lc in merged_layer_configs.values()))
+        - 1
+        if replay_retention and merged_layer_configs
+        else 0
+    )
     extra_retained_tokens = vllm_config.num_reprefillable_tokens
     for layer_name, layer_config in merged_layer_configs.items():
         config = layer_config.manager_config
+        if replay_retention and layer_config.manager_cls not in (
+            FullAttentionManager,
+            SlidingWindowManager,
+        ):
+            raise ValueError(
+                "PD replay retention requires full attention or "
+                "plain SlidingWindowManager groups"
+            )
         if isinstance(config.params, SlidingWindowManager.Params):
             merged_layer_configs[layer_name] = replace(
                 layer_config,
                 manager_config=config.replace_params(
-                    extra_retained_tokens=extra_retained_tokens
+                    extra_retained_tokens=extra_retained_tokens,
+                    pd_replay_retention_tokens=(
+                        replay_margin
+                        if not config.params.bounded_replay
+                        else int(replay_retention)
+                    ),
                 ),
             )
 

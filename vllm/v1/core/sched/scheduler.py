@@ -2330,20 +2330,24 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids: set[str] = set()
-        if kv_connector_output and kv_connector_output.failed_recving:
-            failed_kv_load_req_ids.update(
-                self._handle_failed_recving(kv_connector_output.failed_recving)
-            )
-        if kv_connector_output and kv_connector_output.invalid_block_ids:
-            # These blocks contain externally computed tokens that failed to
-            # load. Identify affected requests and adjust their computed token
-            # count to trigger recomputation of the invalid blocks.
-            failed_kv_load_req_ids.update(
-                self._handle_invalid_blocks(
-                    kv_connector_output.invalid_block_ids,
-                    num_scheduled_tokens,
+        try:
+            if kv_connector_output and kv_connector_output.failed_recving:
+                failed_kv_load_req_ids.update(
+                    self._handle_failed_recving(kv_connector_output.failed_recving)
                 )
-            )
+            if kv_connector_output and kv_connector_output.invalid_block_ids:
+                # These blocks contain externally computed tokens that failed to
+                # load. Identify affected requests and adjust their computed token
+                # count to trigger recomputation of the invalid blocks.
+                failed_kv_load_req_ids.update(
+                    self._handle_invalid_blocks(
+                        kv_connector_output.invalid_block_ids,
+                        num_scheduled_tokens,
+                    )
+                )
+        finally:
+            if self.kv_cache_manager.pd_replay is not None:
+                self.kv_cache_manager.pd_replay.complete_step(scheduler_output)
         if kv_connector_output and kv_connector_output.mrope_position_deltas:
             # Record before the loop below can finish (and free) a request.
             for req_id, delta in kv_connector_output.mrope_position_deltas.items():

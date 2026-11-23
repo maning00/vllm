@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_pd import PDReplayRetention
 from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -145,6 +146,7 @@ class KVCacheManager:
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
     ) -> None:
+        self.pd_replay: PDReplayRetention | None = None
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
         # collapses to the prior (uncapped) admission behavior. The scheduler
@@ -214,6 +216,15 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+    def enable_pd_replay_retention(
+        self, num_hash_lookahead_tokens: int, *, producer: bool
+    ) -> PDReplayRetention:
+        """Enable request-scoped PD storage without changing prefix-hit rules."""
+        if self.pd_replay is not None:
+            raise ValueError("PD replay retention is already bound to this pool")
+        self.pd_replay = PDReplayRetention(self, num_hash_lookahead_tokens, producer)
+        return self.pd_replay
 
     @property
     def usage(self) -> float:
@@ -501,6 +512,18 @@ class KVCacheManager:
                 "computed tokens to adopt"
             )
 
+        replay_created = (
+            self.pd_replay is not None
+            and request.request_id not in self.pd_replay.allocations
+        )
+        if self.pd_replay is not None:
+            self.pd_replay.prepare(
+                request,
+                num_external_computed_tokens,
+                local_tokens=request.num_computed_tokens + num_new_computed_tokens,
+            )
+            replay_created &= request.request_id in self.pd_replay.allocations
+
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
             if self.retained_hit_group_ids:
@@ -556,6 +579,9 @@ class KVCacheManager:
             )
             required_blocks = num_blocks_to_allocate + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                if replay_created:
+                    assert self.pd_replay is not None
+                    self.pd_replay.forget(request.request_id)
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -596,6 +622,9 @@ class KVCacheManager:
         required_blocks = num_blocks_to_allocate + watermark_blocks
         if required_blocks > available_blocks:
             # Cannot allocate new blocks
+            if replay_created:
+                assert self.pd_replay is not None
+                self.pd_replay.forget(request.request_id)
             return None
 
         if (
@@ -647,6 +676,8 @@ class KVCacheManager:
             request: The request to free the blocks.
 
         """
+        if self.pd_replay is not None:
+            self.pd_replay.forget(request.request_id)
         self.coordinator.free(request)
 
     def remove_skipped_blocks(
@@ -681,6 +712,8 @@ class KVCacheManager:
             The request's blocks in allocation order.
 
         """
+        if self.pd_replay is not None:
+            self.pd_replay.forget(request.request_id)
         return self.coordinator.pop_blocks_for_free(request)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
