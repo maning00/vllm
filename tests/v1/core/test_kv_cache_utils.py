@@ -751,6 +751,20 @@ def test_free_kv_cache_block_queue_get_all_free_blocks():
     assert_free_queue(queue, [blocks[1], blocks[3], blocks[4]], [blocks[2]])
 
 
+def test_free_queue_generation_distinguishes_reinserted_nodes():
+    block = KVCacheBlock(1)
+    queue = FreeKVCacheBlockQueue([block])
+    assert block.free_queue_generation == 0
+    assert queue.popleft() is block
+    assert block.free_queue_generation == 1
+    queue.append(block)
+    queue.remove(block)
+    assert block.free_queue_generation == 2
+    queue.prepend_cached_n([block])
+    assert queue.popleft_n(1) == [block]
+    assert block.free_queue_generation == 3
+
+
 def test_generate_block_hash_extra_keys():
     request = make_request(
         request_id="0",

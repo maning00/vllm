@@ -6990,3 +6990,56 @@ def test_external_leases_receive_key_token_boundaries():
         (block.block_id, make_block_hash_with_group_id(key, 3), (i + 1) * 4)
         for i, (block, key) in enumerate(zip(blocks, request.block_hashes))
     ]
+
+
+class _ClassifyingLeases(_ExternalLeases):
+    def __init__(self, redundant):
+        super().__init__(window=0)
+        self.redundant = redundant
+        self.batches = []
+
+    def classify_freed(self, blocks):
+        self.batches.append(list(blocks))
+        return [b.block_id in self.redundant for b in blocks]
+
+
+def test_freed_classification_preserves_batches_and_refree_order():
+    pool = BlockPool(9, enable_caching=True, hash_block_size=4)
+    blocks = pool.get_new_blocks(5)
+    request = make_request("classify", list(range(20)), 4, sha256)
+    pool.cache_full_blocks(request, blocks, 0, 5, 4, 0)
+    leases = _ClassifyingLeases({b.block_id for b in blocks[:4]})
+    pool.lease_guard = leases
+    pool.free_blocks([blocks[1], blocks[0]])
+    pool.free_blocks([blocks[3], blocks[2]])
+    cached = lambda: list(
+        pool.free_block_queue.iter_blocks_after(None, cached_only=True)
+    )
+    assert cached() == [blocks[3], blocks[2], blocks[1], blocks[0]]
+    pool.touch([blocks[1]])
+    pool.free_blocks([blocks[1]])
+    assert cached() == [blocks[1], blocks[3], blocks[2], blocks[0]]
+    pool.free_blocks([blocks[4]], evict_first=True)
+    assert cached()[0] is blocks[4]
+    assert leases.batches == [blocks[1::-1], blocks[3:1:-1], [blocks[1]]]
+    assert pool.get_new_blocks(3) == pool.blocks[6:]
+
+
+def test_freed_classification_uses_each_owning_pool_once():
+    pools = [BlockPool(5, enable_caching=True, hash_block_size=4) for _ in range(2)]
+    request = make_request("multi-pool", list(range(8)), 4, sha256)
+    groups = [p.get_new_blocks(2) for p in pools]
+    guards = [_ClassifyingLeases({1}), _ClassifyingLeases({2})]
+    for pool, blocks, guard in zip(pools, groups, guards):
+        pool.cache_full_blocks(request, blocks, 0, 2, 4, 0)
+        pool.lease_guard = guard
+    pools[0].touch([groups[0][0]])
+    pools[0].free_blocks([groups[1][0], groups[0][1], groups[1][1], groups[0][0]])
+    assert guards[0].batches == [[groups[0][1]]]
+    assert guards[1].batches == [groups[1]]
+    assert (
+        list(pools[1].free_block_queue.iter_blocks_after(None, cached_only=True))
+        == groups[1][::-1]
+    )
+    pools[0].free_blocks([groups[0][0]])
+    assert guards[0].batches[-1] == [groups[0][0]]

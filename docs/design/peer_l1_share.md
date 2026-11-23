@@ -17,6 +17,10 @@ Only finalized full blocks may be shared.
 The free queue keeps uncached rows before cached rows and explicit keep-last
 rows. `evict_first=True` inserts before other cached rows without displacing
 uncached capacity. Invalidation and successful reset maintain that boundary.
+An optional lease-guard `classify_freed(blocks) -> list[bool]` classifies each
+batch of newly free cached rows once. True rows go to the cached front in their
+original order; other rows retain normal LRU placement. Explicit `evict_first`
+overrides that hint. Each pool invokes its own guard.
 
 The native owner can grant rows between scheduler steps. A retired pinned free
 row is withheld rather than reused. If `W` is the interval's initial reserve and

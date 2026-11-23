@@ -37,7 +37,11 @@ logger = init_logger(__name__)
 
 
 class BlockLeaseGuard(Protocol):
-    """Protect cached blocks while external readers access their contents."""
+    """Protect cached blocks while external readers access their contents.
+
+    Guards may additionally implement `classify_freed(blocks) -> list[bool]`.
+    True places a cached row before other cached rows, in batch order.
+    """
 
     def on_cached(
         self,
@@ -916,6 +920,17 @@ class BlockPool:
                     cached_to_evict_first.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
+                    blocks_to_evict_last.append(block)
+
+        freed_cached = blocks_to_evict_last
+        classify = getattr(self.lease_guard, "classify_freed", None)
+        if freed_cached and classify is not None:
+            redundant = classify(freed_cached)
+            blocks_to_evict_last = []
+            for block, first in zip(freed_cached, redundant, strict=True):
+                if first:
+                    cached_to_evict_first.append(block)
+                else:
                     blocks_to_evict_last.append(block)
 
         # Blocks to reuse first are prepended to the front of the free queue.

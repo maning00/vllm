@@ -179,6 +179,9 @@ class KVCacheBlock:
     # These two attributes should only be manipulated by FreeKVCacheBlockQueue.
     prev_free_block: "KVCacheBlock | None" = None
     next_free_block: "KVCacheBlock | None" = None
+    free_queue_generation: int = field(
+        default=0, repr=False, compare=False, kw_only=True
+    )
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
@@ -250,8 +253,7 @@ class FreeKVCacheBlockQueue:
     list of free blocks. We implement this class instead of using Python
     builtin deque to support removing a block in the middle of the queue
     in O(1) time. To close the performance gap to the builtin deque which is
-    implemented in C++, this class does not allocate any Python objects when
-    manipulating the linked list. Instead, this class manipulates the
+    implemented in C++, this class reuses block objects as list nodes, using the
     prev_free_block and next_free_block attributes of the given blocks.
 
     The queue is ordered by block ID in the beginning. When a block is allocated
@@ -336,6 +338,7 @@ class FreeKVCacheBlockQueue:
 
         # Remove the block from the linked list.
         first_block.prev_free_block = first_block.next_free_block = None
+        first_block.free_queue_generation += 1
 
         self.num_free_blocks -= 1
         return first_block
@@ -375,6 +378,7 @@ class FreeKVCacheBlockQueue:
             # Reset prev_free_block and next_free_block of all popped blocks
             last_block.prev_free_block = None
             last_block.next_free_block = None
+            last_block.free_queue_generation += 1
 
         if curr_block is not None:
             # The queue is not empty, connect the fake head to
@@ -406,6 +410,7 @@ class FreeKVCacheBlockQueue:
 
         # Remove the block from the linked list.
         block.prev_free_block = block.next_free_block = None
+        block.free_queue_generation += 1
         self.num_free_blocks -= 1
 
     def append(self, block: KVCacheBlock) -> None:
