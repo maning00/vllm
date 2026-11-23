@@ -2257,11 +2257,11 @@ def test_prefill(hash_fn):
     assert free_block_queue.num_free_blocks == 0
     assert (
         free_block_queue.fake_free_list_head.next_free_block
-        is free_block_queue.fake_free_list_tail
+        is free_block_queue._cached_boundary
     )
     assert (
         free_block_queue.fake_free_list_tail.prev_free_block
-        is free_block_queue.fake_free_list_head
+        is free_block_queue._cached_boundary
     )
 
 
@@ -6930,6 +6930,53 @@ def test_external_leases_evict_pinned_free_block():
     assert pool.free_block_queue.num_free_blocks == 1
     assert pool.get_new_blocks(1) == [block]
     assert pool.free_block_queue.num_free_blocks == 0
+
+
+@pytest.mark.cpu_test
+def test_cached_front_respects_empty_blocks_and_invalidation():
+    pool = BlockPool(7, enable_caching=True, hash_block_size=4)
+    request = make_request("segments", list(range(12)), 4, sha256)
+    blocks = pool.get_new_blocks(3)
+    pool.cache_full_blocks(request, blocks, 0, 3, 4, 0)
+    pool.free_blocks(blocks[:2])
+    pool.free_blocks(blocks[2:], evict_first=True)
+    assert pool.free_block_queue.get_all_free_blocks() == [
+        *pool.blocks[4:],
+        blocks[2],
+        blocks[0],
+        blocks[1],
+    ]
+    pool.evict_blocks({blocks[1].block_id})
+    assert list(pool.free_block_queue.iter_blocks_after(None, cached_only=True)) == [
+        blocks[2],
+        blocks[0],
+    ]
+    assert pool.get_new_blocks(1) == [blocks[1]]
+    assert not pool.reset_prefix_cache()
+    pool.free_blocks([blocks[1]])
+    order = pool.free_block_queue.get_all_free_blocks()
+    assert pool.reset_prefix_cache()
+    assert pool.free_block_queue.get_all_free_blocks() == order
+    assert not list(pool.free_block_queue.iter_blocks_after(None, cached_only=True))
+    # A reset must not leave formerly cached empty rows behind new cache entries.
+    allocated = pool.get_new_blocks(1)
+    pool.cache_full_blocks(request, allocated, 0, 1, 4, 0)
+    pool.free_blocks(allocated, evict_first=True)
+    assert pool.get_new_blocks(len(order) - 1) == order[1:]
+    assert pool.get_new_blocks(1) == allocated
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("caching", [False, True])
+def test_unpin_keeps_unhashed_blocks_last(caching):
+    pool = BlockPool(5, enable_caching=caching, hash_block_size=4)
+    block = pool.get_new_blocks(1)[0]
+    reused: list[KVCacheBlock] = []
+    pool.unpin_blocks([block], reused.append)
+    assert pool.get_new_blocks(3) == pool.blocks[2:]
+    assert not reused
+    assert pool.get_new_blocks(1) == [block]
+    assert reused == [block]
 
 
 def test_external_leases_receive_key_token_boundaries():

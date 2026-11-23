@@ -286,17 +286,20 @@ class FreeKVCacheBlockQueue:
         # in the queue has prev and next blocks.
         self.fake_free_list_head = KVCacheBlock(block_id=-1)
         self.fake_free_list_tail = KVCacheBlock(block_id=-1)
+        self._cached_boundary = KVCacheBlock(block_id=-1)
+        self._cached_boundary.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = self._cached_boundary
         if self.num_free_blocks > 0:
             # Connect fake_head and fake_tail to the first and last block
             # respectively.
             self.fake_free_list_head.next_free_block = blocks[0]
             blocks[0].prev_free_block = self.fake_free_list_head
-            self.fake_free_list_tail.prev_free_block = blocks[-1]
-            blocks[-1].next_free_block = self.fake_free_list_tail
+            self._cached_boundary.prev_free_block = blocks[-1]
+            blocks[-1].next_free_block = self._cached_boundary
         else:
             # For empty list, simply connect the fake head and tail.
-            self.fake_free_list_head.next_free_block = self.fake_free_list_tail
-            self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
+            self.fake_free_list_head.next_free_block = self._cached_boundary
+            self._cached_boundary.prev_free_block = self.fake_free_list_head
 
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
@@ -307,6 +310,9 @@ class FreeKVCacheBlockQueue:
         """
         head = self.fake_free_list_head
         first_block = head.next_free_block
+        if first_block is self._cached_boundary:
+            head = self._cached_boundary
+            first_block = head.next_free_block
         if first_block is self.fake_free_list_tail or first_block is None:
             assert self.num_free_blocks == 0, (
                 f"num_free_blocks ({self.num_free_blocks}) is out of sync "
@@ -347,22 +353,21 @@ class FreeKVCacheBlockQueue:
         if n == 0:
             return []
         assert self.num_free_blocks >= n
+        if n == 1:
+            return [self.popleft()]
         self.num_free_blocks -= n
 
+        anchor = self.fake_free_list_head
         curr_block = self.fake_free_list_head.next_free_block
-        if n == 1:
-            assert curr_block is not None
-            next_block = curr_block.next_free_block
-            curr_block.prev_free_block = None
-            curr_block.next_free_block = None
-            if next_block is not None:
-                self.fake_free_list_head.next_free_block = next_block
-                next_block.prev_free_block = self.fake_free_list_head
-            return [curr_block]
 
         # Pop n blocks from the head of the list
         ret = []
         for _ in range(n):
+            if curr_block is self._cached_boundary:
+                anchor.next_free_block = curr_block
+                curr_block.prev_free_block = anchor
+                anchor = curr_block
+                curr_block = curr_block.next_free_block
             assert curr_block is not None
             ret.append(curr_block)
             last_block = curr_block
@@ -374,8 +379,8 @@ class FreeKVCacheBlockQueue:
         if curr_block is not None:
             # The queue is not empty, connect the fake head to
             # the new first block.
-            self.fake_free_list_head.next_free_block = curr_block
-            curr_block.prev_free_block = self.fake_free_list_head
+            anchor.next_free_block = curr_block
+            curr_block.prev_free_block = anchor
         return ret
 
     def remove(self, block: KVCacheBlock) -> None:
@@ -385,6 +390,8 @@ class FreeKVCacheBlockQueue:
             block: The block to remove.
 
         """
+        if block is self._cached_boundary:
+            raise RuntimeError("Cannot remove the cached-segment boundary")
         prev_block = block.prev_free_block
         next_block = block.next_free_block
         if prev_block is None or next_block is None:
@@ -473,6 +480,35 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += len(blocks)
 
+    def prepend_cached_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Insert before other cached blocks, preserving the batch's order."""
+        if not blocks:
+            return
+        following = self._cached_boundary.next_free_block
+        assert following is not None
+        previous = self._cached_boundary
+        for block in blocks:
+            previous.next_free_block = block
+            block.prev_free_block = previous
+            previous = block
+        previous.next_free_block = following
+        following.prev_free_block = previous
+        self.num_free_blocks += len(blocks)
+
+    def mark_all_uncached(self) -> None:
+        """Reset the segment boundary without changing real-block order."""
+        previous = self._cached_boundary.prev_free_block
+        following = self._cached_boundary.next_free_block
+        assert previous is not None and following is not None
+        previous.next_free_block = following
+        following.prev_free_block = previous
+        last = self.fake_free_list_tail.prev_free_block
+        assert last is not None
+        last.next_free_block = self._cached_boundary
+        self._cached_boundary.prev_free_block = last
+        self._cached_boundary.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = self._cached_boundary
+
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.
 
@@ -490,22 +526,27 @@ class FreeKVCacheBlockQueue:
         # As long as next_free_block is available, we haven't reached to
         # the fake tail yet.
         while curr_block.next_free_block is not None:
-            ret.append(curr_block)
+            if curr_block is not self._cached_boundary:
+                ret.append(curr_block)
             curr_block = curr_block.next_free_block
         return ret
 
     def iter_blocks_after(
         self,
         cursor: KVCacheBlock | None,
+        *,
+        cached_only: bool = False,
     ) -> Iterator[KVCacheBlock]:
         """Iterate free blocks in eviction order after the cursor."""
         if cursor is None:
-            curr_block = self.fake_free_list_head.next_free_block
+            start = self._cached_boundary if cached_only else self.fake_free_list_head
+            curr_block = start.next_free_block
         else:
             curr_block = cursor.next_free_block
 
         while curr_block is not None and curr_block is not self.fake_free_list_tail:
-            yield curr_block
+            if curr_block is not self._cached_boundary:
+                yield curr_block
             curr_block = curr_block.next_free_block
 
 

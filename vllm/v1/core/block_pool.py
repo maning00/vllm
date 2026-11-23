@@ -839,6 +839,14 @@ class BlockPool:
             return False, pinned
 
         self._emit_block_removed_events(evicted_hashes)
+        if (
+            not popped
+            and not pinned
+            and block.ref_cnt == 0
+            and block.prev_free_block is not None
+        ):
+            self.free_block_queue.remove(block)
+            self.free_block_queue.prepend_n([block])
         return True, pinned
 
     def return_withheld(self, blocks: list[KVCacheBlock]) -> None:
@@ -889,6 +897,7 @@ class BlockPool:
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
+        cached_to_evict_first = []
         other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
         for block in ordered_blocks:
             if block.is_null:  # never pooled; its ref_cnt is not maintained
@@ -900,16 +909,18 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
-                if block.block_hash is None or not self.enable_caching or evict_first:
-                    # LIFO reuse of non-cached blocks for better GPU locality,
-                    # and of cached ones when asked to evict them first.
+                if block.block_hash is None or not self.enable_caching:
+                    # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
+                elif evict_first:
+                    cached_to_evict_first.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
                     blocks_to_evict_last.append(block)
 
         # Blocks to reuse first are prepended to the front of the free queue.
         self.free_block_queue.prepend_n(blocks_to_evict_first)
+        self.free_block_queue.prepend_cached_n(cached_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
         self.free_block_queue.append_n(blocks_to_evict_last)
         for pool, blocks in other_pools.items():
@@ -975,6 +986,7 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+        self.free_block_queue.mark_all_uncached()
 
         if self.metrics_collector:
             self.metrics_collector.reset()

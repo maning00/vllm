@@ -622,260 +622,133 @@ def test_kv_cache_block_uses_slots():
         block.unexpected_field = True
 
 
+def assert_free_queue(queue, uncached, cached):
+    boundary = queue._cached_boundary
+    nodes = [
+        queue.fake_free_list_head,
+        *uncached,
+        boundary,
+        *cached,
+        queue.fake_free_list_tail,
+    ]
+    for previous, following in zip(nodes, nodes[1:]):
+        assert previous.next_free_block is following
+        assert following.prev_free_block is previous
+    real = [*uncached, *cached]
+    assert queue.num_free_blocks == len(real)
+    assert queue.get_all_free_blocks() == real
+    assert list(queue.iter_blocks_after(None)) == real
+    assert list(queue.iter_blocks_after(None, cached_only=True)) == cached
+    for i, block in enumerate(real):
+        assert list(queue.iter_blocks_after(block)) == real[i + 1 :]
+
+
 def test_free_kv_cache_block_queue_initialization():
-    # Test with a single block
-    block = KVCacheBlock(block_id=0)
-    queue = FreeKVCacheBlockQueue([block])
-    assert queue.num_free_blocks == 1
-    assert queue.fake_free_list_head.next_free_block is block
-    assert queue.fake_free_list_tail.prev_free_block is block
+    for count in (0, 1, 5):
+        blocks = [KVCacheBlock(i) for i in range(count)]
+        assert_free_queue(FreeKVCacheBlockQueue(blocks), blocks, [])
 
 
 def test_free_kv_cache_block_queue_operations():
-    # Create a list of KVCacheBlock objects
-    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
-
-    # Create a FreeKVCacheBlockQueue with these blocks
+    blocks = [KVCacheBlock(i) for i in range(5)]
     queue = FreeKVCacheBlockQueue(blocks)
-
-    # Check initial state
-    assert queue.num_free_blocks == 5
-    assert queue.fake_free_list_head.next_free_block is blocks[0]
-    assert queue.fake_free_list_tail.prev_free_block is blocks[4]
-
-    # Pop the first block
-    block1 = queue.popleft()
-    assert block1 == blocks[0]
-    assert queue.num_free_blocks == 4
-    assert queue.fake_free_list_head.next_free_block is blocks[1]
-    assert queue.fake_free_list_tail.prev_free_block is blocks[4]
-
-    # Remove a block from the middle
-    block_to_remove = blocks[2]
-    queue.remove(block_to_remove)
-    assert queue.num_free_blocks == 3
-    assert blocks[1].next_free_block is blocks[3]
-    assert blocks[3].prev_free_block is blocks[1]
-
-    # Append a block back
-    queue.append(block_to_remove)
-    assert queue.num_free_blocks == 4
-    assert queue.fake_free_list_tail.prev_free_block is block_to_remove
-    assert block_to_remove.prev_free_block is blocks[4]
-    assert block_to_remove.next_free_block is queue.fake_free_list_tail
-
-    # Pop blocks until empty
-    for _ in range(4):
+    assert queue.popleft() is blocks[0]
+    queue.remove(blocks[2])
+    assert_free_queue(queue, [blocks[1], blocks[3], blocks[4]], [])
+    queue.append(blocks[2])
+    assert_free_queue(queue, [blocks[1], blocks[3], blocks[4]], [blocks[2]])
+    assert queue.popleft_n(4) == [blocks[1], blocks[3], blocks[4], blocks[2]]
+    assert_free_queue(queue, [], [])
+    with pytest.raises(ValueError, match="No free blocks available"):
         queue.popleft()
-    assert queue.num_free_blocks == 0
-    assert queue.fake_free_list_head.next_free_block is queue.fake_free_list_tail
-    assert queue.fake_free_list_tail.prev_free_block is queue.fake_free_list_head
-
-    # Attempt to pop from an empty queue
-    with pytest.raises(ValueError) as e:
-        queue.popleft()
-    assert str(e.value) == "No free blocks available"
+    with pytest.raises(RuntimeError, match="boundary"):
+        queue.remove(queue._cached_boundary)
+    with pytest.raises(RuntimeError, match="invalid block"):
+        queue.remove(blocks[0])
 
 
 def test_free_kv_cache_block_queue_append_n():
-    # Create an empty FreeKVCacheBlockQueue with these blocks
+    blocks = [KVCacheBlock(i) for i in range(6)]
     queue = FreeKVCacheBlockQueue([])
-    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
-    # Append 0 block
-    # fake_head->fake_tail
     queue.append_n([])
-    assert queue.num_free_blocks == 0
-    assert queue.fake_free_list_head.next_free_block is queue.fake_free_list_tail
-    assert queue.fake_free_list_tail.prev_free_block is queue.fake_free_list_head
-    # Append 1 block
-    # fake_head->b0->fake_tail
-    queue.append_n(blocks[0:1])
-    assert queue.num_free_blocks == 1
-    assert queue.fake_free_list_head.next_free_block is blocks[0]
-    assert blocks[0].prev_free_block is queue.fake_free_list_head
-    assert blocks[0].next_free_block is queue.fake_free_list_tail
-    assert queue.fake_free_list_tail.prev_free_block is blocks[0]
-    # Append 2 blocks
-    # fake_head->b0->b4->b5->fake_tail
-    queue.append_n(blocks[4:6])
-    assert queue.num_free_blocks == 3
-    assert queue.fake_free_list_head.next_free_block is blocks[0]
-    assert blocks[0].prev_free_block is queue.fake_free_list_head
-    assert blocks[0].next_free_block is blocks[4]
-    assert blocks[4].prev_free_block is blocks[0]
-    assert blocks[4].next_free_block is blocks[5]
-    assert blocks[5].prev_free_block is blocks[4]
-    assert blocks[5].next_free_block is queue.fake_free_list_tail
-    assert queue.fake_free_list_tail.prev_free_block is blocks[5]
-    # Append 3 blocks
-    # fake_head->b0->b4->b5->b1->b2->b3->fake_tail
-    queue.append_n(blocks[1:4])
-    assert queue.num_free_blocks == 6
-    assert queue.fake_free_list_head.next_free_block is blocks[0]
-    assert blocks[0].prev_free_block is queue.fake_free_list_head
-    assert blocks[0].next_free_block is blocks[4]
-    assert blocks[4].prev_free_block is blocks[0]
-    assert blocks[4].next_free_block is blocks[5]
-    assert blocks[5].prev_free_block is blocks[4]
-    assert blocks[5].next_free_block is blocks[1]
-    assert blocks[1].prev_free_block is blocks[5]
-    assert blocks[1].next_free_block is blocks[2]
-    assert blocks[2].prev_free_block is blocks[1]
-    assert blocks[2].next_free_block is blocks[3]
-    assert blocks[3].prev_free_block is blocks[2]
-    assert blocks[3].next_free_block is queue.fake_free_list_tail
-    assert queue.fake_free_list_tail.prev_free_block is blocks[3]
-
-    # Create an empty FreeKVCacheBlockQueue
+    assert_free_queue(queue, [], [])
+    expected = []
+    for batch in (blocks[:1], blocks[4:], blocks[1:4]):
+        queue.append_n(batch)
+        expected.extend(batch)
+        assert_free_queue(queue, [], expected)
     invalid_queue = FreeKVCacheBlockQueue([])
-    # set prev_free_block to None and this will cause assertion in append_n
     invalid_queue.fake_free_list_tail.prev_free_block = None
     with pytest.raises(AssertionError):
-        # Append 1 block
-        # fake_head->fake_tail
-        invalid_queue.append_n(blocks[0:1])
+        invalid_queue.append_n([blocks[0]])
     assert invalid_queue.num_free_blocks == 0
-    assert (
-        invalid_queue.fake_free_list_head.next_free_block
-        == invalid_queue.fake_free_list_tail
-    )
 
 
 def test_free_kv_cache_block_queue_prepend_n():
-    # Seed the queue with one block so prepend has an existing head to splice
-    # in front of (fake_head->b0->fake_tail).
-    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
-    queue = FreeKVCacheBlockQueue(blocks[0:1])
-
-    # Prepend 0 blocks is a no-op.
+    blocks = [KVCacheBlock(i) for i in range(6)]
+    queue = FreeKVCacheBlockQueue([blocks[0]])
     queue.prepend_n([])
-    assert queue.num_free_blocks == 1
-    assert queue.fake_free_list_head.next_free_block is blocks[0]
-
-    # Prepend 2 blocks; they land in front of the existing head, in order.
-    # fake_head->b4->b5->b0->fake_tail
-    queue.prepend_n(blocks[4:6])
-    assert queue.num_free_blocks == 3
-    assert queue.fake_free_list_head.next_free_block is blocks[4]
-    assert blocks[4].prev_free_block is queue.fake_free_list_head
-    assert blocks[4].next_free_block is blocks[5]
-    assert blocks[5].prev_free_block is blocks[4]
-    assert blocks[5].next_free_block is blocks[0]
-    assert blocks[0].prev_free_block is blocks[5]
-    assert blocks[0].next_free_block is queue.fake_free_list_tail
-    assert queue.fake_free_list_tail.prev_free_block is blocks[0]
-
-    # A second prepend goes ahead of everything previously prepended.
-    # fake_head->b1->b2->b4->b5->b0->fake_tail
+    assert_free_queue(queue, blocks[:1], [])
+    queue.prepend_n(blocks[4:])
+    assert_free_queue(queue, [blocks[4], blocks[5], blocks[0]], [])
     queue.prepend_n(blocks[1:3])
-    assert queue.num_free_blocks == 5
-    assert queue.fake_free_list_head.next_free_block is blocks[1]
-    assert blocks[1].next_free_block is blocks[2]
-    assert blocks[2].next_free_block is blocks[4]
-
-    # The popleft order reflects the front-to-back queue order.
-    assert [queue.popleft().block_id for _ in range(5)] == [1, 2, 4, 5, 0]
-    assert queue.num_free_blocks == 0
+    expected = [blocks[1], blocks[2], blocks[4], blocks[5], blocks[0]]
+    assert_free_queue(queue, expected, [])
+    assert queue.popleft_n(5) == expected
+    assert_free_queue(queue, [], [])
 
 
-def test_free_kv_cache_block_queue_popleft_n():
-    blocks = [KVCacheBlock(block_id=i) for i in range(6)]
-    # Create an empty FreeKVCacheBlockQueue with these blocks
-    queue = FreeKVCacheBlockQueue(
-        [blocks[1], blocks[3], blocks[5], blocks[4], blocks[0], blocks[2]]
-    )
-    assert queue.num_free_blocks == 6
-    assert queue.fake_free_list_head.next_free_block is blocks[1]
-    assert blocks[1].prev_free_block is queue.fake_free_list_head
-    assert blocks[1].next_free_block is blocks[3]
-    assert blocks[3].prev_free_block is blocks[1]
-    assert blocks[3].next_free_block is blocks[5]
-    assert blocks[5].prev_free_block is blocks[3]
-    assert blocks[5].next_free_block is blocks[4]
-    assert blocks[4].prev_free_block is blocks[5]
-    assert blocks[4].next_free_block is blocks[0]
-    assert blocks[0].prev_free_block is blocks[4]
-    assert blocks[0].next_free_block is blocks[2]
-    assert blocks[2].prev_free_block is blocks[0]
-    assert blocks[2].next_free_block is queue.fake_free_list_tail
-    assert queue.fake_free_list_tail.prev_free_block is blocks[2]
-
-    # Pop 0 block
-    # fake_head->b1->b3->b5->b4->b0->b2->fake_tail
-    assert len(queue.popleft_n(0)) == 0
-    assert queue.num_free_blocks == 6
-    # Pop 1 block
-    # fake_head->b3->b5->b4->b0->b2->fake_tail
-    result_blocks = queue.popleft_n(1)
-    assert queue.num_free_blocks == 5
-    assert len(result_blocks) == 1
-    assert result_blocks[0] is blocks[1]
-    for block in result_blocks:
-        assert block.prev_free_block is None
-        assert block.next_free_block is None
-    # Pop 2 blocks
-    # fake_head->b4->b0->b2->fake_tail
-    result_blocks = queue.popleft_n(2)
-    assert len(result_blocks) == 2
-    assert queue.num_free_blocks == 3
-    assert result_blocks[0] is blocks[3]
-    assert result_blocks[1] is blocks[5]
-    for block in result_blocks:
-        assert block.prev_free_block is None
-        assert block.next_free_block is None
-    # Pop 3 blocks
-    # fake_head->fake_tail
-    result_blocks = queue.popleft_n(3)
-    assert len(result_blocks) == 3
-    assert queue.num_free_blocks == 0
-    assert result_blocks[0] is blocks[4]
-    assert result_blocks[1] is blocks[0]
-    assert result_blocks[2] is blocks[2]
-    for block in result_blocks:
-        assert block.prev_free_block is None
-        assert block.next_free_block is None
-
-
-@pytest.mark.parametrize("num_blocks", [1, 2, 16])
-def test_free_kv_cache_block_queue_popleft_n_drain_and_refill(num_blocks):
-    """Draining a batch must leave the sentinels ready for reuse."""
-    blocks = [KVCacheBlock(block_id=i) for i in range(num_blocks)]
-    queue = FreeKVCacheBlockQueue(blocks)
-
-    assert queue.popleft_n(num_blocks) == blocks
-    assert queue.num_free_blocks == 0
-    assert queue.fake_free_list_head.next_free_block is queue.fake_free_list_tail
-    assert queue.fake_free_list_tail.prev_free_block is queue.fake_free_list_head
-    assert all(b.prev_free_block is None and b.next_free_block is None for b in blocks)
+@pytest.mark.parametrize("uncached_count", [0, 1, 3, 6])
+@pytest.mark.parametrize("batch_size", [1, 2, 6])
+def test_free_kv_cache_block_queue_popleft_n(uncached_count, batch_size):
+    blocks = [KVCacheBlock(i) for i in range(6)]
+    queue = FreeKVCacheBlockQueue(blocks[:uncached_count])
+    queue.append_n(blocks[uncached_count:])
     assert queue.popleft_n(0) == []
-
+    assert queue.popleft_n(batch_size) == blocks[:batch_size]
+    assert_free_queue(
+        queue,
+        blocks[batch_size:uncached_count],
+        blocks[max(batch_size, uncached_count) :],
+    )
+    assert all(
+        b.prev_free_block is None and b.next_free_block is None
+        for b in blocks[:batch_size]
+    )
+    assert queue.popleft_n(6 - batch_size) == blocks[batch_size:]
+    assert_free_queue(queue, [], [])
     queue.append_n(blocks)
-    assert queue.popleft_n(num_blocks) == blocks
-    assert queue.num_free_blocks == 0
+    assert queue.popleft_n(6) == blocks
+    assert_free_queue(queue, [], [])
+
+
+def test_free_kv_cache_block_queue_cached_front_and_reset():
+    blocks = [KVCacheBlock(i) for i in range(8)]
+    queue = FreeKVCacheBlockQueue(blocks[:2])
+    queue.append_n(blocks[2:4])
+    queue.prepend_cached_n([])
+    queue.prepend_cached_n(blocks[4:6])
+    queue.prepend_cached_n(blocks[6:])
+    cached = [*blocks[6:], *blocks[4:6], *blocks[2:4]]
+    assert_free_queue(queue, blocks[:2], cached)
+    queue.remove(blocks[1])
+    queue.remove(blocks[6])
+    assert_free_queue(queue, blocks[:1], cached[1:])
+    queue.mark_all_uncached()
+    assert_free_queue(queue, [blocks[0], *cached[1:]], [])
+    queue.prepend_cached_n([blocks[1]])
+    assert queue.popleft_n(6) == [blocks[0], *cached[1:]]
+    assert queue.popleft() is blocks[1]
+    assert_free_queue(queue, [], [])
 
 
 def test_free_kv_cache_block_queue_get_all_free_blocks():
-    # Create a list of KVCacheBlock objects
-    blocks = [KVCacheBlock(block_id=i) for i in range(5)]
-
-    # Create a FreeKVCacheBlockQueue with these blocks
+    blocks = [KVCacheBlock(i) for i in range(5)]
     queue = FreeKVCacheBlockQueue(blocks)
-
-    # Check all blocks are correctly retrieved
-    assert queue.get_all_free_blocks() == blocks
-
-    # Pop a block and check again
     queue.popleft()
-    assert queue.get_all_free_blocks() == blocks[1:]
-
-    # Remove a block and check again
-    block_to_remove = blocks[2]
-    queue.remove(block_to_remove)
-    assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:]
-
-    # Append a block back and check again
-    queue.append(block_to_remove)
-    assert queue.get_all_free_blocks() == blocks[1:2] + blocks[3:] + [block_to_remove]
+    queue.remove(blocks[2])
+    queue.append(blocks[2])
+    assert_free_queue(queue, [blocks[1], blocks[3], blocks[4]], [blocks[2]])
 
 
 def test_generate_block_hash_extra_keys():

@@ -709,6 +709,8 @@ def test_idle_owner_applies_late_cleanup_to_real_pool(scheduler_resources, withh
     scheduler.build()
     scheduler.update(KVConnectorOutput(kv_connector_worker_meta=PeerWorkerMetadata(1)))
     pool.free_blocks([block], evict_first=True)
+    if withhold == "pop":
+        _cache_unused_prefix(scheduler, pool)
     key = peer_key(make_block_hash_with_group_id(request.block_hashes[3], 0))
     woke = threading.Event()
     scheduler.set_engine_wakeup(woke.set)
@@ -1135,6 +1137,37 @@ def adaptive_peer(scheduler_resources):
         yield create
 
 
+def _cache_unused_prefix(peer, pool):
+    """Make cached-front eviction reachable without displacing empty rows."""
+    from tests.v1.core.test_prefix_caching import make_request
+    from vllm.distributed.kv_transfer.kv_connector.v1.peer_l1.data import (
+        PeerWorkerMetadata,
+    )
+    from vllm.utils.hashing import sha256
+    from vllm.v1.outputs import KVConnectorOutput
+
+    while True:
+        unused = [
+            b
+            for b in pool.free_block_queue.get_all_free_blocks()
+            if b.block_hash is None
+        ]
+        if not unused:
+            break
+        count = min(len(unused), pool.get_num_free_blocks())
+        assert count > 0
+        fillers = pool.get_new_blocks(count)
+        request = make_request(
+            f"filler-{uuid4().hex}", list(range(10000, 10000 + count * 16)), 4, sha256
+        )
+        pool.cache_full_blocks(request, fillers, 0, count, 16, 0)
+        pool.free_blocks(fillers)
+    peer.build()
+    peer.update(
+        KVConnectorOutput(kv_connector_worker_meta=PeerWorkerMetadata(peer.step))
+    )
+
+
 def _publish_blocks(peer, pool, count):
     from tests.v1.core.test_prefix_caching import make_request
     from vllm.distributed.kv_transfer.kv_connector.v1.peer_l1.data import (
@@ -1174,6 +1207,7 @@ def test_adaptive_window_preserves_multigroup_allocation(adaptive_peer, free, ma
     # Publish before the test window, then return rows to the queue head.
     blocks, keys = _publish_blocks(peer, pool, effective)
     pool.free_blocks(blocks, evict_first=True)
+    _cache_unused_prefix(peer, pool)
     peer.build()
     effective = min(maximum, free // 9)
     grant = channel.acquire_exact(keys) if keys else None
