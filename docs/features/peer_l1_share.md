@@ -95,12 +95,14 @@ Committed IPC grants remain pinned until completion or cancellation.
 Queueing, session setup and the step fence share the original half-lease bound;
 the transfer timeout does not extend the lease.
 
-Sleep mode is unsupported. For PD deployments, enable peer L1 only on the
-prefill instance using `MultiConnector [PD connector, PeerL1Connector]`.
+Sleep mode is unsupported. For PD deployments, the default `full` role belongs
+on the prefill instance using `MultiConnector [PD connector, PeerL1Connector]`.
 MultiConnector selects the first positive hit; any child that requests waiting
 makes the whole lookup wait. An unselected peer grant is cancelled.
-Composition on decode instances or with other prefix sources, such as offloading
-or LMCache, is unsupported: each request loads from only one child.
+The [decode owner role](peer_l1_decode_lending.md) also lends cached KV from a
+decode instance without competing with PD for request loads. Other prefix
+sources, such as offloading or LMCache, remain unsupported: each request loads
+from only one child.
 The RDMA mover has one I/O thread, so a slow source can delay other reads.
 Quarantine is a safety mechanism, not an admission guarantee: already submitted
 reads can exceed its threshold before feedback disables new reads.

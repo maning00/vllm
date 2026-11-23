@@ -124,6 +124,8 @@ def compatible(local: PeerMemory, remote: PeerMemory) -> bool:
         return False
     return bool(
         local.kv_compatibility_id
+        and remote.role in ("full", "decode")
+        and (local.role != "decode" or remote.role == "full")
         and local.kv_compatibility_id == remote.kv_compatibility_id
         and local.compatibility == remote.compatibility
         and local.hash_settings == remote.hash_settings
@@ -354,3 +356,15 @@ class CandidateReplicas:
 
     def query(self, keys: list[bytes]) -> np.ndarray:
         return np.concatenate((self.local.query(keys), self.remote.query(keys)), axis=1)
+
+    def capacity(self, peer: int) -> int:
+        return (
+            self.local.capacity(peer)
+            if peer < self.local_count
+            else self.remote.capacity(peer - self.local_count)
+        )
+
+    def try_query_any(self, keys: list[bytes]) -> np.ndarray | None:
+        local = self.local.try_query_any(keys)
+        remote = self.remote.try_query_any(keys)
+        return None if local is None or remote is None else local | remote

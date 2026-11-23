@@ -169,6 +169,9 @@ class AsyncReceives:
                 if self.stats is not None:
                     self.stats.inc("worker_rdma_reads", int(read.submitted))
                     self.stats.inc("worker_rdma_bytes", read.num_bytes)
+                    if read.job.memory is not None and read.job.memory.role == "decode":
+                        self.stats.inc("worker_decode_rdma_bytes", read.num_bytes)
+                        self.stats.inc("worker_decode_rdma_failures", int(failed))
                     if failed:
                         self.stats.inc(f"worker_rdma_failure_{reason}")
                     self.stats.inc("worker_rdma_successes", int(not failed))

@@ -68,6 +68,7 @@ def memory_description(
         {},
         instance_id=domain.instance_id or instance,
         kv_compatibility_id=domain.compatibility_id,
+        role=str(transfer.kv_connector_extra_config.get("role", "full")),
         hash_settings=hashlib.sha256(
             repr(
                 (
@@ -121,6 +122,10 @@ def validated_members(
         ):
             raise ValueError(
                 "Peer instance identity or prefix hash settings differ across ranks"
+            )
+        if member.role != local.role:
+            raise ValueError(
+                "Peer roles differ across ranks; use one role per instance"
             )
     return members
 

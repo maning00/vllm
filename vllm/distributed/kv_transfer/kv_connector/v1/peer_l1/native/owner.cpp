@@ -22,16 +22,22 @@ int64_t l1_owner_start(const char* endpoint, uint64_t epoch, uint64_t rows,
                        uint64_t cap, uint64_t window, int lease_ms,
                        uint64_t log_capacity, uint64_t initial_window,
                        uint8_t* published, const Key* credential,
-                       int64_t (*clock_ns)()) {
+                       int64_t (*clock_ns)(), uint64_t protected_cap) {
   return checked([&] {
-    return reinterpret_cast<int64_t>(
-        new Owner(endpoint, epoch, rows, cap, window, lease_ms, log_capacity,
-                  initial_window, published, credential, clock_ns));
+    return reinterpret_cast<int64_t>(new Owner(
+        endpoint, epoch, rows, cap, window, lease_ms, log_capacity,
+        initial_window, published, credential, clock_ns, protected_cap));
   });
 }
 int64_t l1_owner_stop(void* owner) {
   delete static_cast<Owner*>(owner);
   return 0;
+}
+int64_t l1_owner_gate(void* owner, int open) {
+  return checked([&] {
+    static_cast<Owner*>(owner)->gate(open);
+    return 0;
+  });
 }
 int64_t l1_owner_describe(void* owner, const int64_t* hello, size_t n_hello,
                           const int64_t* members, size_t n_members) {
@@ -105,11 +111,21 @@ int64_t l1_replica_generation(void* replica, size_t peer) {
 int64_t l1_replica_window(void* replica, size_t peer) {
   return checked([&] { return static_cast<Replica*>(replica)->window(peer); });
 }
+int64_t l1_replica_capacity(void* replica, size_t peer) {
+  return checked(
+      [&] { return static_cast<Replica*>(replica)->capacity(peer); });
+}
 int64_t l1_replica_query(void* replica, const uint64_t* keys, size_t n,
                          uint8_t* out) {
   return checked([&] {
     static_cast<Replica*>(replica)->query(keys, n, out);
     return 0;
+  });
+}
+int64_t l1_replica_query_any(void* replica, const uint64_t* keys, size_t n,
+                             uint8_t* out) {
+  return checked([&] {
+    return static_cast<Replica*>(replica)->try_query_any(keys, n, out) ? 1 : 0;
   });
 }
 int64_t l1_owner_rpc(const char* endpoint, uint64_t op, uint64_t epoch,

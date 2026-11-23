@@ -16,8 +16,8 @@ struct Event {
   uint64_t seq, key, present;
 };
 struct Frame {
-  uint64_t magic = 0x4c31535542534335ULL;
-  uint64_t epoch, seq, n, snapshot, generation, window;
+  uint64_t magic = 0x4c31535542534336ULL;
+  uint64_t epoch, seq, n, snapshot, generation, window, capacity;
 };
 
 class Owner {
@@ -49,11 +49,14 @@ class Owner {
   std::deque<std::shared_ptr<EventChunk>> events_;
   uint64_t first_chunk_ = 0;
   uint64_t epoch_, cap_, window_max_, window_, new_pins_ = 0, withheld_ = 0;
+  uint64_t protected_cap_, budget_rows_ = 0;
+  std::vector<int64_t> budget_releases_;
+  bool gate_open_ = true;
   uint8_t* published_;
   uint64_t sequence_ = 0, refs_ = 0;
   int64_t generation_ = 0;
   // Order matches NativeOwner.STATS.
-  std::array<uint64_t, 18> stats_{};
+  std::array<uint64_t, 23> stats_{};
   uint64_t withheld_current_ = 0;
   uint64_t queued_keys_ = 0;
   uint64_t deferred_serial_ = 0;
@@ -67,6 +70,40 @@ class Owner {
   std::atomic<bool> stop_{false};
   std::thread subscription_thread_;
   std::string sub_endpoint_;
+
+  bool budget_enabled() const { return protected_cap_ != ~uint64_t{0}; }
+  bool budget_fits(uint64_t extra, uint64_t reserve) const {
+    return !budget_enabled() ||
+           (budget_rows_ <= protected_cap_ &&
+            extra <= protected_cap_ - budget_rows_ &&
+            reserve <= protected_cap_ - budget_rows_ - extra);
+  }
+  uint64_t desired_window(uint64_t free) const {
+    auto desired = gate_open_ ? std::min(window_max_, free / 9) : 0;
+    if (budget_enabled())
+      desired = std::min(desired, (protected_cap_ - budget_rows_) / 2);
+    return desired;
+  }
+  void budget_stats() {
+    if (!budget_enabled()) return;
+    stats_[18] = budget_rows_ + window_ - withheld_;
+    stats_[19] = std::max(stats_[19], stats_[18]);
+    if (stats_[18] > protected_cap_)
+      throw std::logic_error("peer protected capacity overflow");
+  }
+  void protect(Row& row) {
+    if (budget_enabled() && !row.budgeted) {
+      row.budgeted = true;
+      ++budget_rows_;
+    }
+  }
+  void unprotect(Row& row) {
+    if (row.budgeted && !row.pins && !row.absorbed && !row.withheld &&
+        !row.budget_pending) {
+      row.budgeted = false;
+      --budget_rows_;
+    }
+  }
 
   void wake() {
     uint64_t one = 1;
@@ -105,10 +142,12 @@ class Owner {
         --rows_[row].pins;
         --refs_;
         if (!rows_[row].pins) changed(row);
+        unprotect(rows_[row]);
       }
       grants_.erase(saved);
     }
     completed_[id.first] = std::max(completed_[id.first], id.second);
+    budget_stats();
   }
   void expire() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -145,6 +184,10 @@ class Owner {
     if (frozen_ || request.seq <= completed_[request.reader] || keys.empty() ||
         keys.size() > cap_)
       return {};
+    if (!gate_open_) {
+      ++stats_[21];
+      return {-3 - generation_, -2};
+    }
     std::set<int64_t> unique;
     for (auto& key : keys) {
       auto* row = directory_.find(key);
@@ -153,10 +196,13 @@ class Owner {
       unique.insert(*row);
     }
     size_t extra = 0;
+    size_t extra_budget = 0;
     for (auto row : unique) extra += !rows_[row].absorbed && !rows_[row].window;
+    for (auto row : unique) extra_budget += !rows_[row].budgeted;
     if ((request.op == AcquireDeferred ||
          request.op == AcquireDeferredLeased) &&
-        (new_pins_ + extra > window_ || refs_ + unique.size() > cap_)) {
+        (new_pins_ + extra > window_ || refs_ + unique.size() > cap_ ||
+         !budget_fits(extra_budget, window_ - withheld_))) {
       if (queued_keys_ + keys.size() > cap_) {
         ++stats_[3];
         return {-3 - generation_, static_cast<int64_t>(window_)};
@@ -179,6 +225,10 @@ class Owner {
       ++stats_[new_pins_ + extra > window_ ? 2 : 3];
       return {-3 - generation_, static_cast<int64_t>(window_)};
     }
+    if (!budget_fits(extra_budget, window_ - withheld_)) {
+      ++stats_[20];
+      return {-3 - generation_, static_cast<int64_t>(window_)};
+    }
     auto created = lease_now();
     bool leased =
         request.op == AcquireLeased || request.op == AcquireDeferredLeased;
@@ -194,6 +244,7 @@ class Owner {
     }
     for (auto row : unique) {
       auto& state = rows_[row];
+      protect(state);
       if (!state.absorbed && !state.window) {
         state.window = true;
         window_rows_.push_back(row);
@@ -205,6 +256,7 @@ class Owner {
     }
     ++stats_[0];
     stats_[1] += unique.size();
+    budget_stats();
     return result;
   }
 
@@ -214,6 +266,7 @@ class Owner {
     bool subscribed = false;
     uint64_t sequence = 0;
     uint64_t generation = 0;
+    uint64_t capacity = 0;
     std::vector<char> buffer;
     Clock::time_point progress = Clock::now();
   };
@@ -239,6 +292,12 @@ class Owner {
       frame.seq = sequence_;
       frame.generation = generation_;
       frame.window = window_;
+      frame.capacity =
+          gate_open_
+              ? (budget_enabled()
+                     ? std::min(protected_cap_ - budget_rows_, cap_ - refs_)
+                     : cap_)
+              : 0;
     }
     // References keep chunks alive across log rotation. Appends write only
     // entries beyond frame.seq, so the selected entries are immutable.
@@ -249,11 +308,13 @@ class Owner {
         batch.push_back(chunks[(seq - 1) / 64 - first]->at((seq - 1) % 64));
     }
     if (client.subscribed && batch.empty() &&
-        client.generation == frame.generation)
+        client.generation == frame.generation &&
+        client.capacity == frame.capacity)
       return true;
     frame.n = batch.size();
     client.sequence = frame.seq;
     client.generation = frame.generation;
+    client.capacity = frame.capacity;
     client.subscribed = true;
     client.buffer.resize(sizeof(frame) + sizeof(Event) * batch.size());
     memcpy(client.buffer.data(), &frame, sizeof(frame));
@@ -343,18 +404,21 @@ class Owner {
   Owner(const char* endpoint, uint64_t epoch, size_t rows, uint64_t cap,
         uint64_t window, int lease_ms, size_t log_capacity,
         uint64_t initial_window, uint8_t* published, const Key* credential,
-        int64_t (*clock_ns)() = nullptr)
+        int64_t (*clock_ns)() = nullptr, uint64_t protected_cap = ~uint64_t{0})
       : clock_ns_(clock_ns),
         rows_(rows),
         epoch_(epoch),
         cap_(cap),
         window_max_(window),
         window_(std::min(window, initial_window)),
+        protected_cap_(protected_cap),
         published_(published),
         lease_ms_(lease_ms),
         wake_(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)),
         log_capacity_(log_capacity),
         sub_endpoint_(subscription_endpoint(endpoint)) {
+    if (budget_enabled()) window_ = std::min(window_, protected_cap_ / 2);
+    budget_stats();
     if (credential) credential_ = *credential;
     if (wake_ < 0) throw std::runtime_error("peer L1 eventfd failed");
     try {
@@ -392,6 +456,13 @@ class Owner {
     close(wake_);
   }
   int wake_fd() const { return wake_; }
+  void gate(bool open) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (gate_open_ != open) {
+      gate_open_ = open;
+      ++generation_;
+    }
+  }
   void describe(const int64_t* hello, size_t n_hello, const int64_t* members,
                 size_t n_members) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -428,6 +499,7 @@ class Owner {
       if (withheld_ > window_)
         throw std::logic_error("peer L1 window overflow");
       changed(row_id);
+      budget_stats();
     }
     if (row.pins && mode == 2 && !row.absorbed) {
       // Protect an in-use row before its local reference can be freed.
@@ -463,6 +535,9 @@ class Owner {
           rows_[id].pins && !rows_[id].absorbed && !rows_[id].withheld;
     auto headroom = free_blocks > fast_touches ? free_blocks - fast_touches : 0;
     uint64_t free_budget = free_blocks == ~uint64_t{0} ? 0 : headroom / 2;
+    auto reserve_before = window_ - withheld_;
+    // No caller can allocate during the atomic scheduler absorb.
+    if (budget_enabled()) window_ = withheld_;
     for (auto it = grants_.begin(); queued_keys_ && it != grants_.end();) {
       auto current = it++;
       auto& [id, grant] = *current;
@@ -477,18 +552,21 @@ class Owner {
         unique.insert(*row);
       }
       uint64_t cost = 0;
+      uint64_t extra_budget = 0;
       for (auto row : unique)
         cost += !rows_[row].absorbed && !rows_[row].pins && !live.count(row);
+      for (auto row : unique) extra_budget += !rows_[row].budgeted;
       int rejected =
-          frozen_ ? 12
+          frozen_       ? 12
+          : !gate_open_ ? 22
           : grant.deferred_leased &&
                   lease_now() >=
                       grant.created + std::chrono::milliseconds(lease_ms_)
               ? 13
-          : result.size() != grant.pending_keys.size() ? 14
-          : refs_ + unique.size() > cap_               ? 15
-          : cost > free_budget                         ? 16
-                                                       : 0;
+          : result.size() != grant.pending_keys.size()          ? 14
+          : refs_ + unique.size() > cap_                        ? 15
+          : cost > free_budget || !budget_fits(extra_budget, 0) ? 16
+                                                                : 0;
       if (rejected) {
         ++stats_[rejected];
         finish(id);
@@ -504,6 +582,7 @@ class Owner {
       grant.unique_rows.assign(unique.begin(), unique.end());
       free_budget -= cost;
       for (auto row : unique) {
+        protect(rows_[row]);
         ++rows_[row].pins;
         ++refs_;
         changed(row);
@@ -536,6 +615,11 @@ class Owner {
         action = 2;
       }
       if (action) {
+        if (budget_enabled() && (action == 2 || action == 3) &&
+            !row.budget_pending) {
+          row.budget_pending = true;
+          budget_releases_.push_back(id);
+        }
         out[n++] = action;
         out[n++] = id;
       }
@@ -544,20 +628,23 @@ class Owner {
     for (auto id : window_rows_) rows_[id].window = false;
     window_rows_.clear();
     stats_[6] = withheld_current_;
-    stats_[7] = window_ - withheld_;
+    stats_[7] = reserve_before;
     new_pins_ = withheld_ = 0;
     // A touch removes at most one free row; releases only add free rows.
     // Reserve <= 1/8 of the resulting admissible headroom, fixed per window.
     if (free_blocks != ~uint64_t{0}) {
       auto headroom = free_blocks > touches ? free_blocks - touches : 0;
-      window_ = std::min(window_max_, headroom / 9);
-    }
+      window_ = desired_window(headroom);
+    } else if (budget_enabled())
+      window_ = 0;
     stats_[8] = window_;
     stats_[9] = window_;
-    stats_.back() = refs_;
+    stats_[17] = refs_;
+    budget_stats();
     std::copy(stats_.begin(), stats_.end(), stats);
     std::fill(stats_.begin(), stats_.begin() + 5, 0);
     std::fill(stats_.begin() + 10, stats_.begin() + 17, 0);
+    std::fill(stats_.begin() + 20, stats_.end(), 0);
     ++generation_;
     return n;
   }
@@ -567,13 +654,21 @@ class Owner {
   }
   void complete_absorb(uint64_t free_blocks, uint64_t* stats) {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto desired = std::min(window_max_, free_blocks / 9);
+    for (auto id : budget_releases_) {
+      rows_[id].budget_pending = false;
+      unprotect(rows_[id]);
+    }
+    budget_releases_.clear();
+    auto desired = desired_window(free_blocks);
     if (desired > window_) {
       window_ = desired;
       ++generation_;
     }
     stats[8] = window_ - withheld_;
     stats[9] = window_;
+    budget_stats();
+    stats[18] = stats_[18];
+    stats[19] = stats_[19];
   }
   bool pending() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -587,6 +682,7 @@ class Owner {
     std::lock_guard<std::mutex> lock(mutex_);
     frozen_ = true;
     return !refs_ && !queued_keys_ && dirty_.empty() &&
+           budget_releases_.empty() &&
            std::none_of(rows_.begin(), rows_.end(),
                         [](const Row& r) { return r.withheld || r.absorbed; });
   }

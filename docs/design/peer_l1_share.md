@@ -4,6 +4,9 @@ The connector's directory contains full-block prefix hashes and physical KV rows
 Placement replicas are hints; the owner revalidates complete keys and its epoch
 before granting a read. KV compatibility includes geometry and hash settings.
 
+See [decode owner invariants](peer_l1_decode_lending.md) for decode cache lending
+and the PD replay-storage lifecycle.
+
 ## Publication
 
 A cached block is initially pending. The worker records completion after all

@@ -79,6 +79,10 @@ class OwnerDeferred(OwnerBusy):
         self.acquired_before = acquired_before
 
 
+class OwnerGated(Exception):
+    """The decode owner is not accepting new readers."""
+
+
 class NativeOwnerChannel:
     def __init__(
         self,
@@ -144,6 +148,8 @@ class NativeOwnerChannel:
         )
         n, out = self._rpc(op, seq, keys)
         if n == 2 and out[0] <= -3:
+            if out[1] == -2:
+                raise OwnerGated()
             if out[1] == -1:
                 raise OwnerDeferred(-3 - int(out[0]), seq, started)
             raise OwnerBusy(-3 - int(out[0]), int(out[1]))

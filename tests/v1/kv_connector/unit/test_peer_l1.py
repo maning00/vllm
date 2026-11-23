@@ -1049,6 +1049,8 @@ def test_peer_stats_cross_real_scheduler_and_prometheus(scheduler_resources):
         scheduled = scheduler.schedule()
         worker = PeerL1Stats()
         worker.inc("worker_copy_bytes", 3072)
+        worker.inc("worker_decode_rdma_bytes", 1024)
+        worker.observe("decode_classify_seconds_per_step", 0.001)
         worker.observe("worker_copy_gpu_seconds", 0.002)
         output = ModelRunnerOutput(
             req_ids=[],
@@ -1073,7 +1075,12 @@ def test_peer_stats_cross_real_scheduler_and_prometheus(scheduler_resources):
         prom.observe(data, engine_idx=1)
         labels = {"model_name": "test", "engine": "1"}
         name = "vllm:peer_l1_"
-        for metric in ("worker_copy_bytes_total", "worker_copy_gpu_seconds_count"):
+        for metric in (
+            "worker_copy_bytes_total",
+            "worker_copy_gpu_seconds_count",
+            "worker_decode_rdma_bytes_total",
+            "decode_classify_seconds_per_step_count",
+        ):
             value = REGISTRY.get_sample_value(name + metric, labels)
             assert value is not None and value > 0
         assert REGISTRY.get_sample_value(name + "owner_reserve", labels) is not None
@@ -1099,9 +1106,10 @@ def adaptive_peer(scheduler_resources):
     base, _, _ = scheduler_resources
     with ExitStack() as stack:
 
-        def create(free, maximum):
+        def create(free, maximum, **options):
             config = deepcopy(base.config)
             config.kv_transfer_config.kv_connector_extra_config["pin_window"] = maximum
+            config.kv_transfer_config.kv_connector_extra_config.update(options)
             cache = KVCacheConfig(
                 free + 1,
                 [],
@@ -1129,6 +1137,9 @@ def adaptive_peer(scheduler_resources):
                 free + 1,
                 ((),),
                 {},
+                role=config.kv_transfer_config.kv_connector_extra_config.get(
+                    "role", "full"
+                ),
             )
             peer.handshake(PeerHandshake([member]))
             channel = NativeOwnerChannel(member.endpoint, 19, 91, peer._cleanup)
@@ -1652,7 +1663,14 @@ def tcp_members(unused_tcp_port_factory, clock):
         cleanup = CleanupQueue(credential=auth)
         stack.callback(cleanup.close)
 
-        def create(rank=0, epoch=19, endpoint=None, window=10, lease_ms=1000):
+        def create(
+            rank=0,
+            epoch=19,
+            endpoint=None,
+            window=10,
+            lease_ms=1000,
+            protected_cap=None,
+        ):
             for _ in range(100):
                 selected = endpoint or f"tcp://127.0.0.1:{unused_tcp_port_factory()}"
                 if selected.endswith(":65535"):
@@ -1666,6 +1684,7 @@ def tcp_members(unused_tcp_port_factory, clock):
                         credential=auth,
                         lease_ms=lease_ms,
                         clock=clock,
+                        protected_cap=protected_cap,
                     )
                     break
                 except RuntimeError as error:
@@ -1881,7 +1900,16 @@ def async_scheduler(scheduler_resources, tcp_members):
     create, publish, _, _, replace_member = tcp_members
     with ExitStack() as stack:
 
-        def start(*, flash=False, ipc_tokens=0, min_gain=1, quarantine_fraction=1 / 16):
+        def start(
+            *,
+            flash=False,
+            ipc_tokens=0,
+            min_gain=1,
+            quarantine_fraction=1 / 16,
+            remote_role="full",
+            remote_cap=None,
+            remote_tokens=1024,
+        ):
             config = deepcopy(base.config)
             if flash:
                 config = VllmConfig(
@@ -1892,7 +1920,11 @@ def async_scheduler(scheduler_resources, tcp_members):
                     scheduler_config=config.scheduler_config,
                     kv_transfer_config=config.kv_transfer_config,
                 )
-            remote, member = create(window=512, lease_ms=30000)
+            remote, member = create(
+                window=512, lease_ms=30000, protected_cap=remote_cap
+            )
+            member = replace_member(member, role=remote_role)
+            publish([(remote, member)])
             prepared, local = create(epoch=911, window=512, lease_ms=30000)
             prepared.close()
             local = replace_member(
@@ -1938,15 +1970,19 @@ def async_scheduler(scheduler_resources, tcp_members):
             policy = scheduler.connector._scheduler
 
             def seed(owner, length):
-                length, hashes = policy._lookup.find_longest_cache_hit(
-                    request.block_hashes, length, lambda h, g: True
-                )
-                keys = [
-                    peer_key(make_block_hash_with_group_id(h, g))
-                    for g, group in enumerate(hashes)
-                    for h in group
-                    if h is not None
-                ]
+                keys: list[bytes] = []
+                lengths = (length, remote_tokens) if owner is remote else (length,)
+                for span in dict.fromkeys(lengths):
+                    _, hashes = policy._lookup.find_longest_cache_hit(
+                        request.block_hashes, span, lambda h, g: True
+                    )
+                    keys.extend(
+                        peer_key(make_block_hash_with_group_id(h, g))
+                        for g, group in enumerate(hashes)
+                        for h in group
+                        if h is not None
+                    )
+                keys = list(dict.fromkeys(keys))
                 owner.publish(keys, list(range(1, len(keys) + 1)))
                 return keys
 
@@ -1964,14 +2000,19 @@ def async_scheduler(scheduler_resources, tcp_members):
             expected = (
                 (ipc_tokens, False)
                 if ipc_tokens and 1024 - ipc_tokens < min_gain * policy.alignment
-                else (1024, True)
+                else (remote_tokens, True)
             )
-            wait_until(
-                lambda: (
+
+            def matched():
+                if remote_cap is not None and remote.pending():
+                    remote.deferred_rows()
+                    remote.absorb(free_blocks=128)
+                return (
                     scheduler.connector.get_num_new_matched_tokens(request, 0)
                     == expected
                 )
-            )
+
+            wait_until(matched)
             scheduled = scheduler.schedule()
             return scheduler, request, scheduled, remote, ipc
 

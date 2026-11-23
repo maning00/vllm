@@ -97,7 +97,21 @@ def library():
     ptr, u64, size = ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t
     string, integer = ctypes.c_char_p, ctypes.c_int
     signatures = {
-        "owner_start": [string, u64, u64, u64, u64, integer, u64, u64, ptr, ptr, ptr],
+        "owner_start": [
+            string,
+            u64,
+            u64,
+            u64,
+            u64,
+            integer,
+            u64,
+            u64,
+            ptr,
+            ptr,
+            ptr,
+            u64,
+        ],
+        "owner_gate": [ptr, integer],
         "owner_stop": [ptr],
         "owner_describe": [ptr, ptr, size, ptr, size],
         "owner_publish": [ptr, ptr, ptr, size],
@@ -121,7 +135,9 @@ def library():
         "replica_stop": [ptr],
         "replica_generation": [ptr, size],
         "replica_window": [ptr, size],
+        "replica_capacity": [ptr, size],
         "replica_query": [ptr, ptr, size, ptr],
+        "replica_query_any": [ptr, ptr, size, ptr],
         "cleanup_start": [integer],
         "cleanup_stop": [ptr],
         "cleanup_pending": [ptr],
@@ -210,6 +226,11 @@ class NativeOwner:
         "owner_deferred_reject_cap",
         "owner_deferred_reject_budget",
         "owner_external_refs",
+        "owner_protected_blocks",
+        "owner_protected_high_water",
+        "owner_busy_protected_cap",
+        "owner_busy_gate",
+        "owner_deferred_reject_gate",
     )
 
     def __init__(
@@ -223,6 +244,7 @@ class NativeOwner:
         lease_ms: int = 1000,
         log_capacity: int = 4096,
         initial_window: int | None = None,
+        protected_cap: int | None = None,
         credential: bytes = b"",
         clock: Callable[[], float] | None = None,
     ):
@@ -230,6 +252,8 @@ class NativeOwner:
             raise ValueError("Peer L1 owner limits must be positive")
         if initial_window is not None and not 0 <= initial_window <= window:
             raise ValueError("Initial window must be between zero and pin_window")
+        if protected_cap is not None and protected_cap < 0:
+            raise ValueError("Protected capacity must be nonnegative")
         self.endpoint, self.epoch = endpoint, epoch
         self._lib = library()
         self._published = bytearray(rows + 1)
@@ -255,6 +279,7 @@ class NativeOwner:
             ctypes.addressof(self._published_buffer),
             auth.ctypes.data,
             self._clock,
+            (1 << 64) - 1 if protected_cap is None else protected_cap,
         )
         self._absorbed = np.empty(rows * 2, dtype=np.int64)
         self._stats = np.zeros(len(self.STATS), dtype=np.uint64)
@@ -340,6 +365,9 @@ class NativeOwner:
             self._handle, free_blocks, self._stats.ctypes.data
         )
 
+    def set_gate(self, open: bool) -> None:
+        self._lib.l1_owner_gate(self._handle, open)
+
     def admission_reserve(self) -> int:
         return self._lib.l1_owner_reserve(self._handle)
 
@@ -377,6 +405,9 @@ class PlacementReplica:
     def window(self, peer: int) -> int:
         return self._lib.l1_replica_window(self._handle, peer)
 
+    def capacity(self, peer: int) -> int:
+        return self._lib.l1_replica_capacity(self._handle, peer)
+
     def query(self, keys: list[bytes]) -> np.ndarray:
         identities = key_array(keys)
         short = np.ascontiguousarray(identities[:, 0])
@@ -385,6 +416,16 @@ class PlacementReplica:
             self._handle, short.ctypes.data, len(keys), result.ctypes.data
         )
         return result
+
+    def try_query_any(self, keys: list[bytes]) -> np.ndarray | None:
+        """Return an aggregate hint, or None rather than waiting for an update."""
+        identities = key_array(keys)
+        short = np.ascontiguousarray(identities[:, 0])
+        result = np.empty(len(keys), dtype=np.uint8)
+        acquired = self._lib.l1_replica_query_any(
+            self._handle, short.ctypes.data, len(keys), result.ctypes.data
+        )
+        return result if acquired else None
 
     def close(self) -> None:
         if self._handle:

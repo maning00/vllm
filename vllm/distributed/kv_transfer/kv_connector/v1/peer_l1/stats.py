@@ -41,11 +41,25 @@ RDMA_FAILURE_REASONS = (
 )
 
 COUNTERS = {
+    "decode_classify_calls": "Batched free-row classification calls.",
+    "decode_classify_rows": "Cached rows classified on their final release.",
+    "decode_classify_contended": (
+        "Classification batches conservatively placed on contention."
+    ),
+    "decode_order_front_rows": "Newly redundant rows placed at the cached front.",
+    "decode_order_retired_rows": "Previously redundant rows moved to the tail.",
+    "decode_order_scanned_rows": "Free queue nodes visited by bounded retirement.",
+    "decode_gate_closures": "Decode lending gate close episodes.",
+    "owner_busy_protected_cap": "Acquires rejected by the shared protected-row budget.",
+    "owner_busy_gate": "New acquires rejected by decode load gates.",
+    "reader_decode_tokens": "Matched peer tokens sourced from decode owners.",
+    "worker_decode_rdma_bytes": "RDMA bytes submitted against decode owners.",
+    "worker_decode_rdma_failures": "Failed receives from decode owners.",
     "reader_rdma_cooldowns": "Owner failure feedback applying RDMA backoff.",
     "reader_rdma_quarantine_stops": "RDMA quarantine disable episodes.",
     **{
         f"owner_deferred_reject_{reason}": "Deferred plans rejected by the owner."
-        for reason in ("frozen", "lease_expiry", "missing_key", "cap", "budget")
+        for reason in ("frozen", "lease_expiry", "missing_key", "cap", "budget", "gate")
     },
     "reader_lookups": "Calls to peer prefix matching, including retries.",
     "reader_quarantined_rows": "Target rows held against uncertain RDMA writes.",
@@ -64,6 +78,9 @@ COUNTERS = {
     "reader_deferred_requests": "Requests first deferred for a busy owner.",
     "reader_deadline_fallbacks": "Requests falling back at the busy deadline.",
     "reader_window_truncations": "Candidate plans shortened by the binding row limit.",
+    "reader_protected_cap_truncations": (
+        "Candidate plans shortened by the decode budget."
+    ),
     "reader_pin_cap_truncations": "Candidate plans shortened by the binding row limit.",
     "reader_granted_rows": "Row positions in selected grants, including aliases.",
     "owner_grants": "New grants issued by this owner, excluding replayed RPCs.",
@@ -81,6 +98,13 @@ COUNTERS = {
     "worker_timing_dropped": "Load steps without timing due to a full event queue.",
 }
 GAUGES = {
+    "owner_protected_blocks": "Conservative protected rows plus admission reserve.",
+    "owner_protected_high_water": "Lifetime maximum of protected rows plus reserve.",
+    "decode_gate_open": "Whether new acquires are allowed by decode load gates.",
+    "decode_no_prefill_free_blocks": (
+        "Rows classified as no-copy at their last release or bounded scan; "
+        "may lag local hits."
+    ),
     "reader_rdma_owners_cooling": "Owners cooling at the last scheduler snapshot.",
     "reader_rdma_quarantine_disabled": "RDMA selection disabled by quarantine.",
     "reader_rdma_quarantine_limit_rows": "Quarantine threshold for RDMA selection.",
@@ -95,6 +119,19 @@ GAUGES = {
     "reader_admissible_free_blocks": "Free blocks minus reserve, clamped at zero.",
 }
 HISTOGRAMS = {
+    "decode_classify_calls_per_step": (
+        POSITIONS,
+        "Classification calls per decode step.",
+    ),
+    "decode_classify_rows_per_step": (POSITIONS, "Rows classified per decode step."),
+    "decode_classify_seconds_per_step": (
+        SECONDS,
+        "Total classification CPU seconds per decode step.",
+    ),
+    "decode_classify_max_seconds_per_step": (
+        SECONDS,
+        "Maximum batch classification CPU seconds in a step.",
+    ),
     "scheduler_seconds_per_step": (
         SECONDS,
         "CPU wall time in connector hooks between metadata builds.",
@@ -118,7 +155,7 @@ HISTOGRAMS = {
             POSITIONS,
             "Row positions before or after a candidate truncation.",
         )
-        for reason in ("window", "pin_cap")
+        for reason in ("window", "pin_cap", "protected_cap")
         for stage in ("requested", "granted")
     },
     "worker_copy_bytes_per_step": (BYTES, "Copy bytes per step with loads."),
@@ -147,7 +184,7 @@ LABELS = {
             "reason",
             reason,
         )
-        for reason in ("frozen", "lease_expiry", "missing_key", "cap", "budget")
+        for reason in ("frozen", "lease_expiry", "missing_key", "cap", "budget", "gate")
     },
     **{
         f"reader_{source}_{metric}": (f"reader_{metric}", "source", source)
@@ -156,7 +193,7 @@ LABELS = {
     },
     **{
         f"reader_{reason}_truncations": ("reader_truncations", "reason", reason)
-        for reason in ("window", "pin_cap")
+        for reason in ("window", "pin_cap", "protected_cap")
     },
     **{
         f"reader_busy_{outcome}_seconds": ("reader_busy_seconds", "outcome", outcome)
@@ -176,7 +213,7 @@ LABELS = {
             "reason",
             reason,
         )
-        for reason in ("window", "pin_cap")
+        for reason in ("window", "pin_cap", "protected_cap")
         for stage in ("requested", "granted")
     },
 }
